@@ -1,5 +1,6 @@
 import os
 import json
+import re
 from flask import Flask, render_template_string, request, Response
 import requests
 
@@ -192,6 +193,25 @@ HTML_TEMPLATE = """
         
         <button type="button" class="btn btn-clear" onclick="clearChat()">清空对话</button>
         
+        <div style="margin-top: 12px;">
+            <div id="search-toggle-btn" onclick="toggleSearch()" style="
+                display: block;
+                width: 100%;
+                background-color: #fff;
+                border: 2px solid #000;
+                padding: 10px;
+                font-size: 16px;
+                font-weight: bold;
+                text-align: center;
+                margin-top: 8px;
+                cursor: pointer;
+                box-sizing: border-box;
+                user-select: none;
+            ">
+                联网搜索：<span id="search-state-text" style="background: #000; color: #fff; padding: 2px 8px;">已开启</span>
+            </div>
+        </div>
+        
         <!-- 底部定位辅助锚点 -->
         <div id="bottom" style="height: 20px;"></div>
     </div>
@@ -200,6 +220,24 @@ HTML_TEMPLATE = """
     <script type="text/javascript">
         // 存储本地对话历史 (格式同 OpenAI: {role, content})
         var chatHistory = [];
+        
+        // 联网搜索开关（默认开启）
+        var searchEnabled = true;
+        function toggleSearch() {
+            searchEnabled = !searchEnabled;
+            var el = document.getElementById('search-state-text');
+            if (searchEnabled) {
+                el.innerHTML = '已开启';
+                el.style.background = '#000';
+                el.style.color = '#fff';
+                el.style.border = '';
+            } else {
+                el.innerHTML = '已关闭';
+                el.style.background = '#fff';
+                el.style.color = '#000';
+                el.style.border = '1px solid #000';
+            }
+        }
 
         // 添加消息到页面的公用函数
         function appendMessage(role, initialContent) {
@@ -293,7 +331,7 @@ HTML_TEMPLATE = """
             };
             
             // 将包含上下文的历史记录发送给后端
-            xhr.send(JSON.stringify({ history: chatHistory }));
+            xhr.send(JSON.stringify({ history: chatHistory, search: searchEnabled }));
         }
 
         // 清空对话
@@ -333,6 +371,46 @@ def download_marked_js():
                 print("成功保存 marked.min.js 到本地。")
         except Exception as e:
             print(f"预下载 marked.min.js 失败（可能处于离线局域网环境）: {e}")
+
+# ================= 联网搜索（Bing，无需 API Key，极低内存占用） =================
+def bing_search(query, max_results=3):
+    results = []
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (X11; Linux armv7l; rv:102.0) Gecko/20100101 Firefox/102.0',
+        'Accept': 'text/html,application/xhtml+xml',
+        'Accept-Language': 'zh-CN,zh;q=0.9'
+    }
+    url = 'https://www.bing.com/search?q=' + requests.utils.quote(query)
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            return results
+        html = resp.text
+        blocks = re.findall(r'<li class="b_algo"[^>]*?>(.*?)</li>', html, re.DOTALL)
+        for block in blocks[:max_results]:
+            title_m = re.search(r'<h2[^>]*?>.*?<a[^>]*?href="([^"]*?)"[^>]*?>(.*?)</a>', block, re.DOTALL)
+            if not title_m:
+                continue
+            url = title_m.group(1)
+            title = re.sub(r'<[^>]+>', '', title_m.group(2)).strip()
+            body = ''
+            snippet_m = re.search(r'<p[^>]*?>(.*?)</p>', block, re.DOTALL)
+            if snippet_m:
+                body = re.sub(r'<[^>]+>', '', snippet_m.group(1)).strip()
+            if title and len(title) < 300:
+                results.append({'title': title, 'url': url, 'body': body[:500]})
+    except Exception as e:
+        print(f"Bing search error: {e}")
+    return results
+
+def format_search_context(results):
+    if not results:
+        return ""
+    ctx = "以下为联网搜索结果，请严格基于这些信息回答用户问题，并在回答末尾注明来源：\n\n"
+    for i, r in enumerate(results, 1):
+        ctx += f"[{i}] {r['title']}\n来源: {r['url']}\n摘要: {r['body']}\n\n"
+    return ctx
+# ====================================================================
 
 @app.route("/")
 def index():
@@ -395,6 +473,20 @@ def chat():
     # 接收来自前端 JS 的全量历史对话
     data = request.json or {}
     history = data.get("history", [])
+    do_search = data.get("search", False)
+    
+    # 联网搜索：找到最后一条用户消息，搜索 Bing，注入结果到上下文
+    if do_search and history:
+        last_user_msg = ""
+        for msg in reversed(history):
+            if msg.get("role") == "user":
+                last_user_msg = msg.get("content", "")
+                break
+        if last_user_msg:
+            search_results = bing_search(last_user_msg)
+            ctx = format_search_context(search_results)
+            if ctx:
+                history.insert(0, {"role": "system", "content": ctx})
     
     if not NVIDIA_API_KEY:
         return "错误: 树莓派服务端未检测到 NVIDIA_API_KEY。请在终端执行 'export NVIDIA_API_KEY=...' 后重启服务。", 500
